@@ -4,3 +4,4 @@ numpy
 matplotlib
 Pillow
 opencv-python-headless
+XlsxWriter

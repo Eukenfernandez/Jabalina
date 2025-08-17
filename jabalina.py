@@ -1,11 +1,15 @@
 # app.py
 # --------------------------------------------------------------
-# App básica (Streamlit) para atleta y entrenador de jabalina — DISEÑO MEJORADO (Tema claro)
+# App básica (Streamlit) para atleta y entrenador de jabalina — DISEÑO MEJORADO (Tema CLARO)
 # --------------------------------------------------------------
 # - Registro de lanzamientos (distancia, notas, vídeo)
 # - Análisis simple de vídeo + extracción de fotogramas
 # - Comparación lado a lado de dos vídeos/fotogramas
-# - Mejores marcas por temporada (Top 3 y resumen histórico)
+# - Mejores marcas por temporada y por disciplina (con edición)
+#   · Lanzamientos (jabalina) — se cargan desde "Lanzamientos"
+#   · Saltos (profundidad, triple, pentasalto)
+#   · Pesas (sentadilla, arrancada, cargada, pull over, pectoral, hip thrust)
+#   · Velocidad
 # - Planificación (calendario simple + objetivos)
 # - Rendimiento (gráficas de progresión y carga percibida)
 # - Prevención de lesiones (registro de molestias)
@@ -18,6 +22,7 @@ import io
 import sqlite3
 import datetime as dt
 from pathlib import Path
+import base64
 
 import numpy as np
 import pandas as pd
@@ -47,11 +52,11 @@ CUSTOM_CSS = """
   --panel: #f7f9fc;     /* tarjetas claras */
   --panel-2: #eef4ff;   /* panel alterno suave */
   --text: #0b1220;      /* texto principal oscuro */
-  --muted: #475569;     /* texto secundario (slate-600) */
-  --brand: #1d4ed8;     /* azul 700 */
-  --accent: #16a34a;    /* verde 600 */
-  --warn: #d97706;      /* amber-600 */
-  --danger: #dc2626;    /* red-600 */
+  --muted: #475569;     /* texto secundario */
+  --brand: #1d4ed8;     /* azul */
+  --accent: #16a34a;    /* verde */
+  --warn: #d97706;      /* ámbar */
+  --danger: #dc2626;    /* rojo */
 }
 
 html, body, [class^=block-container] { background: var(--bg) !important; color: var(--text) !important; }
@@ -99,6 +104,28 @@ a:hover { text-decoration: underline; }
 
 /***** Ocultar marcas Streamlit *****/
 footer, #MainMenu { visibility: hidden; }
+
+/* ====== FIX: encabezados de días en calendarios (evita traducciones raras como "Nosotros") ====== */
+/* React-Day-Picker v8 usa clases rdp-*. Forzamos etiquetas en ES */
+.stDateInput .rdp-head_cell{color:transparent !important;position:relative;font-weight:700;}
+.stDateInput .rdp-head_cell:nth-child(1)::after{content:"Lu";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput .rdp-head_cell:nth-child(2)::after{content:"Ma";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput .rdp-head_cell:nth-child(3)::after{content:"Mi";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput .rdp-head_cell:nth-child(4)::after{content:"Ju";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput .rdp-head_cell:nth-child(5)::after{content:"Vi";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput .rdp-head_cell:nth-child(6)::after{content:"Sá";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput .rdp-head_cell:nth-child(7)::after{content:"Do";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+
+/* Fallback para algunas versiones que no exponen rdp-head_cell */
+.stDateInput thead th[scope="col"]{color:transparent !important;position:relative;font-weight:700;}
+.stDateInput thead th[scope="col"]:nth-child(1)::after{content:"Lu";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput thead th[scope="col"]:nth-child(2)::after{content:"Ma";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput thead th[scope="col"]:nth-child(3)::after{content:"Mi";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput thead th[scope="col"]:nth-child(4)::after{content:"Ju";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput thead th[scope="col"]:nth-child(5)::after{content:"Vi";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput thead th[scope="col"]:nth-child(6)::after{content:"Sá";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.stDateInput thead th[scope="col"]:nth-child(7)::after{content:"Do";color:var(--text);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+
 </style>
 """
 
@@ -203,6 +230,21 @@ SCHEMA = {
             message TEXT
         )
         """
+    ),
+    # NUEVA tabla genérica para mejores marcas de disciplinas que NO son jabalina
+    "best_marks": (
+        """
+        CREATE TABLE IF NOT EXISTS best_marks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            season INTEGER,
+            grp TEXT,           -- 'saltos' | 'pesas' | 'velocidad'
+            discipline TEXT,    -- p.ej. 'salto profundidad', 'triple', 'sentadilla', etc.
+            value REAL,
+            unit TEXT,          -- m, cm, kg, s, etc.
+            notes TEXT
+        )
+        """
     )
 }
 
@@ -221,10 +263,26 @@ def init_db():
 
 # ---------------------------- HELPERS ---------------------------- #
 
+def ensure_table(table: str):
+    """Crea la tabla si no existe usando el SQL del SCHEMA."""
+    sql = SCHEMA.get(table)
+    if sql:
+        with get_conn() as con:
+            con.execute(sql)
+            con.commit()
+
 @st.cache_data(show_spinner=False)
 def load_table(table: str) -> pd.DataFrame:
+    # Garantiza que la tabla exista antes de leer
+    ensure_table(table)
     with get_conn() as con:
-        return pd.read_sql_query(f"SELECT * FROM {table} ORDER BY id DESC", con)
+        try:
+            return pd.read_sql_query(f"SELECT * FROM {table} ORDER BY id DESC", con)
+        except Exception as e:
+            # Si (por ejemplo en despliegues antiguos) aún no existe, devuelve vacío
+            if "no such table" in str(e).lower():
+                return pd.DataFrame()
+            raise
 
 
 def insert_row(table: str, data: dict):
@@ -232,6 +290,14 @@ def insert_row(table: str, data: dict):
     placeholders = ",".join([":" + k for k in data.keys()])
     with get_conn() as con:
         con.execute(f"INSERT INTO {table} ({keys}) VALUES ({placeholders})", data)
+        con.commit()
+
+
+def update_row(table: str, row_id: int, data: dict):
+    set_clause = ",".join([f"{k} = :{k}" for k in data.keys()])
+    data_with_id = {**data, "_id": row_id}
+    with get_conn() as con:
+        con.execute(f"UPDATE {table} SET {set_clause} WHERE id = :_id", data_with_id)
         con.commit()
 
 
@@ -284,13 +350,31 @@ def video_frame_count(video_path: str | Path) -> int:
 
 init_db()
 
+# --- NUEVO: selector de atleta + tipo de prueba ---
+ATHLETES = {
+    "Eneko": "peso",
+    "Iker": "peso",
+    "Lizeta": "peso",
+    "Maddi": "peso",
+    "Paul": "jabalina",
+    "Alaitz": "peso",
+    "Euken": "jabalina",
+    "Mikel": "jabalina",
+}
+
 st.sidebar.title("🏹 Jabalina Coach")
+
+atleta = st.sidebar.selectbox("Atleta", list(ATHLETES.keys()), key="athlete_select")
+athlete_event = ATHLETES[atleta]  # 'jabalina' o 'peso'
+st.sidebar.caption(f"Disciplina principal: **{athlete_event.capitalize()}**")
+
 section = st.sidebar.radio(
     "Navegación",
     [
         "🏠 Lanzamientos",
         "🆚 Comparación",
         "🏆 Mejores marcas",
+        "📝 Entrenamientos",   # ← añadida
         "📈 Rendimiento",
         "🗓️ Planificación",
         "🩹 Lesiones",
@@ -299,16 +383,52 @@ section = st.sidebar.radio(
         "⚙️ Ajustes",
     ],
 )
-
 st.sidebar.caption("MVP — Streamlit + SQLite")
 
-# Normalizar sección (sin emoji para condiciones)
+# Normalizar sección (quita el emoji)
 section_key = section.split(" ", 1)[1]
+
+# --- NUEVO: migración segura de columnas para soportar multi-atleta ---
+def ensure_columns():
+    with get_conn() as con:
+        cur = con.cursor()
+        # throws: añadir athlete, event
+        cur.execute("PRAGMA table_info(throws)")
+        tcols = [r[1] for r in cur.fetchall()]
+        if "athlete" not in tcols:
+            cur.execute("ALTER TABLE throws ADD COLUMN athlete TEXT")
+        if "event" not in tcols:
+            cur.execute("ALTER TABLE throws ADD COLUMN event TEXT")
+
+        # best_marks: añadir athlete
+        cur.execute("PRAGMA table_info(best_marks)")
+        bcols = [r[1] for r in cur.fetchall()]
+        if "athlete" not in bcols:
+            cur.execute("ALTER TABLE best_marks ADD COLUMN athlete TEXT")
+
+        # NUEVO → fatigue: añadir athlete
+        cur.execute("PRAGMA table_info(fatigue)")
+        fcols = [r[1] for r in cur.fetchall()]
+        if "athlete" not in fcols:
+            cur.execute("ALTER TABLE fatigue ADD COLUMN athlete TEXT")
+
+        # NUEVO → gym_logs: añadir athlete
+        cur.execute("PRAGMA table_info(gym_logs)")
+        gcols = [r[1] for r in cur.fetchall()]
+        if "athlete" not in gcols:
+            cur.execute("ALTER TABLE gym_logs ADD COLUMN athlete TEXT")
+
+        con.commit()
+
+ensure_columns()
 
 # ---------------------------- Lanzamientos ---------------------------- #
 
 if section_key == "Lanzamientos":
     st.markdown("## Registro de lanzamientos")
+
+    # Nota: si el atleta es de peso, ocultamos 'Sesión/lugar'
+    is_javelin = (athlete_event == "jabalina")
 
     tab1, tab2 = st.tabs(["✍️ Registrar", "🗂️ Histórico & Vídeo"])
 
@@ -316,9 +436,9 @@ if section_key == "Lanzamientos":
         with st.container():
             c1, c2, c3 = st.columns([1,1,1])
             date = c1.date_input("Fecha", value=dt.date.today())
-            session = c2.text_input("Sesión / lugar", placeholder="Pista, playa, etc.")
+            session = c2.text_input("Sesión / lugar", placeholder="Pista, playa, etc.") if is_javelin else ""
             distance = c3.number_input("Distancia (m)", min_value=0.0, step=0.1)
-            notes = st.text_area("Notas técnicas (penúltimo paso, separación cadera-hombro, etc.)")
+            notes = st.text_area("Notas técnicas")
             video = st.file_uploader("Sube vídeo (opcional)", type=["mp4", "mov", "m4v", "avi"], accept_multiple_files=False)
             if st.button("Guardar lanzamiento", use_container_width=True):
                 video_path = None
@@ -332,20 +452,46 @@ if section_key == "Lanzamientos":
                         "distance": float(distance) if distance else None,
                         "notes": notes,
                         "video_path": video_path,
+                        # NUEVO: guardar atleta y tipo de prueba
+                        "athlete": atleta,
+                        "event": athlete_event,  # 'jabalina' o 'peso'
+                        "est_speed": None,  # compatibilidad
                     },
                 )
                 st.success("Lanzamiento guardado ✅")
                 st.cache_data.clear()
 
     with tab2:
-        df = load_table("throws")
+        # Filtrar por atleta seleccionado
+        df_all = load_table("throws")
+        if len(df_all) > 0 and "athlete" in df_all.columns:
+            df = df_all[df_all["athlete"] == atleta].copy()
+        else:
+            df = df_all.copy()
+
         if len(df) == 0:
-            st.info("Aún no hay lanzamientos registrados.")
+            st.info("Aún no hay lanzamientos registrados para este atleta.")
         else:
             cA, cB = st.columns([2, 1])
             with cA:
                 st.markdown("#### Historial")
-                st.dataframe(df, use_container_width=True)
+                show_cols = ["id", "date", "distance", "notes", "session", "video_path", "event", "athlete"]
+                show_cols = [c for c in show_cols if c in df.columns]
+                st.dataframe(df[show_cols], use_container_width=True)
+
+                with st.expander("Borrar lanzamiento por ID"):
+                    rid = st.number_input(
+                        "ID a borrar",
+                        min_value=int(df["id"].min()),
+                        max_value=int(df["id"].max()),
+                        step=1,
+                        key="throw_del_by_id",
+                    )
+                    if st.button("Eliminar lanzamiento", key="del_throw_btn"):
+                        delete_row("throws", int(rid))
+                        st.success("Lanzamiento eliminado ✅")
+                        st.cache_data.clear()
+
             with cB:
                 st.markdown("#### Revisión de vídeo")
                 ids = df["id"].tolist()
@@ -374,186 +520,557 @@ if section_key == "Lanzamientos":
                                 mime="image/png",
                                 use_container_width=True,
                             )
+                    if st.button("Eliminar registro seleccionado", key="del_selected_throw"):
+                        delete_row("throws", int(selected_id))
+                        st.success("Registro eliminado ✅")
+                        st.cache_data.clear()
                 else:
                     st.warning("Este registro no tiene vídeo adjunto.")
+
 
 # ---------------------------- Comparación ---------------------------- #
 
 elif section_key == "Comparación":
-    st.markdown("## Comparación lado a lado")
+    st.markdown("## 🎥 Comparación lado a lado")
+
+    # Cargamos lanzamientos ya guardados
     df = load_table("throws")
-    if len(df) < 1:
-        st.info("Registra al menos un lanzamiento en la sección 'Lanzamientos'.")
-    else:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("#### Lado A")
-            id1 = st.selectbox("Selecciona A", df["id"].tolist(), index=0, key="cmpA")
-            r1 = df[df.id == id1].iloc[0]
-            if pd.notna(r1.get("video_path")) and str(r1["video_path"]).strip():
-                st.video(r1["video_path"])
-                if cv2 is not None:
-                    total1 = video_frame_count(r1["video_path"]) or 1
-                    idx1 = st.slider("Frame A", 0, max(0, total1 - 1), 0)
-                    f1 = extract_frame(r1["video_path"], idx1)
-                    if f1 is not None:
-                        st.image(f1, caption=f"A — Frame {idx1}")
-            else:
-                st.warning("Sin vídeo en A")
-        with c2:
-            st.markdown("#### Lado B")
-            id2 = st.selectbox("Selecciona B", df["id"].tolist(), index=min(1, len(df)-1), key="cmpB")
-            r2 = df[df.id == id2].iloc[0]
-            if pd.notna(r2.get("video_path")) and str(r2["video_path"]).strip():
-                st.video(r2["video_path"])
-                if cv2 is not None:
-                    total2 = video_frame_count(r2["video_path"]) or 1
-                    idx2 = st.slider("Frame B", 0, max(0, total2 - 1), 0)
-                    f2 = extract_frame(r2["video_path"], idx2)
-                    if f2 is not None:
-                        st.image(f2, caption=f"B — Frame {idx2}")
-            else:
-                st.warning("Sin vídeo en B")
 
-    st.caption("Tip: usa el mismo índice de frame para comparar posturas clave.")
+    # Filtrar SIEMPRE por atleta y por tipo de prueba para no mezclar datos
+    if len(df) > 0:
+        if "athlete" in df.columns:
+            df = df[df["athlete"] == atleta]
+        if "event" in df.columns:
+            df = df[df["event"] == athlete_event]
 
-# ---------------------------- Mejores marcas ---------------------------- #
+    # Filtro: sólo los que tienen video_path válido
+    vids_df = pd.DataFrame()
+    if len(df) > 0 and "video_path" in df.columns:
+        vids_df = df[df["video_path"].astype(str).str.strip() != ""].copy()
+        vids_df = vids_df.dropna(subset=["video_path"])
+
+    # Helper para renderizar video pequeño con <video width="...">
+    def render_small_video_from_bytes(video_bytes: bytes, width: int = 360):
+        import base64 as _b64
+        html = f"""
+        <video width="{width}" controls>
+            <source src="data:video/mp4;base64,{_b64.b64encode(video_bytes).decode()}">
+            Tu navegador no soporta el video.
+        </video>
+        """
+        st.markdown(html, unsafe_allow_html=True)
+
+    def render_small_video_from_path(path: str, width: int = 360):
+        try:
+            with open(path, "rb") as f:
+                video_bytes = f.read()
+            render_small_video_from_bytes(video_bytes, width=width)
+        except Exception:
+            # Fallback a st.video si no podemos leer el archivo
+            st.video(path)
+
+    c1, c2 = st.columns(2)
+
+    # -------------------- LADO A --------------------
+    with c1:
+        st.markdown("#### Lado A")
+        srcA = st.radio("Fuente A", ["Guardado", "Subir archivo"], horizontal=True, key="srcA")
+
+        if srcA == "Guardado":
+            if len(vids_df) == 0:
+                st.info("No hay vídeos guardados aún para este atleta.")
+            else:
+                idA = st.selectbox(
+                    "Selecciona lanzamiento (A)",
+                    vids_df["id"].tolist(),
+                    format_func=lambda i: f"#{i} — {vids_df[vids_df.id==i]['date'].iloc[0]} ({vids_df[vids_df.id==i]['distance'].iloc[0]} m)",
+                    key="selA",
+                )
+                rA = vids_df[vids_df.id == idA].iloc[0]
+                pathA = str(rA["video_path"])
+                render_small_video_from_path(pathA, width=360)
+
+                if cv2 is not None:
+                    totalA = video_frame_count(pathA) or 1
+                    idxA = st.slider("Frame A", 0, max(0, totalA - 1), 0, key="frameA")
+                    fA = extract_frame(pathA, idxA)
+                    if fA is not None:
+                        st.image(fA, caption=f"A — Frame {idxA}")
+        else:
+            v1 = st.file_uploader("Sube vídeo (A)", type=["mp4", "mov", "avi", "m4v"], key="compA_upload")
+            if v1 is not None:
+                video_bytes = v1.read()
+                render_small_video_from_bytes(video_bytes, width=360)
+
+    # -------------------- LADO B --------------------
+    with c2:
+        st.markdown("#### Lado B")
+        srcB = st.radio("Fuente B", ["Guardado", "Subir archivo"], horizontal=True, key="srcB")
+
+        if srcB == "Guardado":
+            if len(vids_df) == 0:
+                st.info("No hay vídeos guardados aún para este atleta.")
+            else:
+                # Intentar elegir un segundo distinto si existe
+                default_id = None
+                if len(vids_df) >= 2:
+                    selA_val = st.session_state.get("selA")
+                    idsB = [int(x) for x in vids_df["id"].tolist() if x != selA_val]
+                    default_id = idsB[0] if idsB else vids_df["id"].tolist()[0]
+
+                optsB = vids_df["id"].tolist()
+                idx_default = optsB.index(default_id) if (default_id in optsB) else 0
+
+                idB = st.selectbox(
+                    "Selecciona lanzamiento (B)",
+                    optsB,
+                    index=idx_default,
+                    format_func=lambda i: f"#{i} — {vids_df[vids_df.id==i]['date'].iloc[0]} ({vids_df[vids_df.id==i]['distance'].iloc[0]} m)",
+                    key="selB",
+                )
+                rB = vids_df[vids_df.id == idB].iloc[0]
+                pathB = str(rB["video_path"])
+                render_small_video_from_path(pathB, width=360)
+
+                if cv2 is not None:
+                    totalB = video_frame_count(pathB) or 1
+                    idxB = st.slider("Frame B", 0, max(0, totalB - 1), 0, key="frameB")
+                    fB = extract_frame(pathB, idxB)
+                    if fB is not None:
+                        st.image(fB, caption=f"B — Frame {idxB}")
+        else:
+            v2 = st.file_uploader("Sube vídeo (B)", type=["mp4", "mov", "avi", "m4v"], key="compB_upload")
+            if v2 is not None:
+                video_bytes = v2.read()
+                render_small_video_from_bytes(video_bytes, width=360)
+
+    st.caption("Tip: usa el mismo índice de frame en A y B para comparar posturas clave (solo vídeos guardados).")
+
 
 elif section_key == "Mejores marcas":
-    st.markdown("## 🏆 Mejores marcas por temporada")
+    st.markdown("## 🏆 Mejores marcas por temporada y disciplina")
 
+    # Cargar datos base, SIEMPRE filtrados por atleta
     df_throws = load_table("throws")
-    df_gym = load_table("gym_logs")
+    df_best = load_table("best_marks")
 
+    if len(df_throws) > 0 and "athlete" in df_throws.columns:
+        df_throws = df_throws[df_throws["athlete"] == atleta].copy()
+    if len(df_best) > 0 and "athlete" in df_best.columns:
+        df_best = df_best[df_best["athlete"] == atleta].copy()
+
+    # Añadir columna season para throws
     if len(df_throws) > 0 and "date" in df_throws.columns:
         df_throws["season"] = pd.to_datetime(df_throws["date"], errors="coerce").dt.year
-    if len(df_gym) > 0 and "date" in df_gym.columns:
-        df_gym["season"] = pd.to_datetime(df_gym["date"], errors="coerce").dt.year
 
+    # Filtrar throws por el evento del atleta (jabalina o peso)
+    is_javelin = (athlete_event == "jabalina")
+    if len(df_throws) > 0 and "event" in df_throws.columns:
+        df_throws_evt = df_throws[df_throws["event"] == athlete_event].copy()
+    else:
+        df_throws_evt = df_throws.copy()
+
+    # Temporadas detectadas (unión de throws filtrados por evento y best_marks)
     seasons = set()
-    if len(df_throws) > 0 and "season" in df_throws.columns:
-        seasons.update(df_throws["season"].dropna().unique().tolist())
-    if len(df_gym) > 0 and "season" in df_gym.columns:
-        seasons.update(df_gym["season"].dropna().unique().tolist())
+    if len(df_throws_evt) > 0 and "season" in df_throws_evt.columns:
+        seasons.update(df_throws_evt["season"].dropna().unique().tolist())
+    if len(df_best) > 0 and "season" in df_best.columns:
+        seasons.update(df_best["season"].dropna().unique().tolist())
     seasons = sorted([int(s) for s in seasons], reverse=True)
 
-    if len(seasons) == 0:
-        st.info("No hay datos registrados para mostrar mejores marcas.")
-    else:
-        selected_season = st.selectbox("Selecciona temporada", seasons)
-        st.markdown(":blue[Resumen de la temporada]")
-        st.write(" ")
+    # Título dinámico del primer tab según el evento del atleta
+    first_tab_title = f"🏹 Lanzamientos ({'jabalina' if is_javelin else 'peso'})"
+    tabs = st.tabs([first_tab_title, "🦘 Saltos", "🏋️ Pesas", "⚡ Velocidad"])
 
-        def _top_n(df: pd.DataFrame, value_col: str, n: int = 3):
-            if len(df) == 0 or value_col not in df.columns:
-                return pd.DataFrame()
-            d = df.dropna(subset=[value_col]).copy()
-            if len(d) == 0:
-                return pd.DataFrame()
-            d[value_col] = pd.to_numeric(d[value_col], errors="coerce")
-            d = d.dropna(subset=[value_col])
-            d = d.sort_values(value_col, ascending=False).head(n)
-            return d
+    # ---------------- Lanzamientos (jabalina o peso, según atleta) ---------------- #
+    with tabs[0]:
+        st.markdown(f"### Ranking de mejores lanzamientos — {('Jabalina' if is_javelin else 'Peso')}")
 
-        # Métricas rápidas (tarjetas)
-        cards = st.columns(4)
-        if len(df_throws) > 0 and "season" in df_throws.columns and "distance" in df_throws.columns:
-            ej = df_throws[df_throws["season"] == selected_season]
-            best = ej["distance"].max() if len(ej) else None
-            with cards[0]:
-                metric_card("Mejor jabalina", f"{best:.2f} m" if pd.notna(best) else "—", "máxima distancia")
-        if len(df_gym) > 0 and "season" in df_gym.columns and "exercise" in df_gym.columns:
-            gym_temp = df_gym[df_gym["season"] == selected_season]
-            def _best_kw(df, pattern):
-                s = df[df["exercise"].str.contains(pattern, case=False, na=False)]
-                return float(s["weight"].max()) if len(s) and not s["weight"].dropna().empty else None
-            with cards[1]:
-                v = _best_kw(gym_temp, "sentadilla")
-                metric_card("Sentadilla", f"{v:.0f} kg" if v else "—", "récord temporada")
-            with cards[2]:
-                v = _best_kw(gym_temp, "pectoral|press banca|bench")
-                metric_card("Pectoral", f"{v:.0f} kg" if v else "—", "récord temporada")
-            with cards[3]:
-                v = _best_kw(gym_temp, "balon medicinal")
-                metric_card("Balón medicinal", f"{v:.0f} kg" if v else "—", "récord temporada")
-
-        st.write(" ")
-        st.markdown("### Top 3 por categoría (con fecha)")
-
-        rows = []
-        if len(df_throws) > 0 and "season" in df_throws.columns:
-            jdf = df_throws[df_throws["season"] == selected_season].copy()
-            if "distance" in jdf.columns:
-                jdf = jdf.rename(columns={"distance": "valor"})
-                top = _top_n(jdf, "valor", 3)
-                for _, r in top.iterrows():
-                    rows.append({
-                        "Categoría": "Jabalina",
-                        "Valor": f"{float(r['valor']):.2f} m",
-                        "Fecha": r.get("date", ""),
-                        "Detalle": r.get("session", "")
-                    })
-        if len(df_gym) > 0 and "season" in df_gym.columns:
-            gym_df = df_gym[df_gym["season"] == selected_season].copy()
-            ejercicios = {
-                "Balón medicinal": ["balon", "medicinal", "med ball"],
-                "Sentadilla": ["sentadilla", "squat"],
-                "Pectoral": ["pector", "press banca", "bench"],
-                "Pull Over": ["pull over"],
-            }
-            if "exercise" in gym_df.columns:
-                col = gym_df["exercise"].astype(str).str.lower()
-                for nombre, kws in ejercicios.items():
-                    mask = np.logical_or.reduce([col.str.contains(k, na=False) for k in kws]) if len(kws)>1 else col.str_contains(kws[0], na=False)
-                    sub = gym_df[mask].copy()
-                    if "weight" in sub.columns:
-                        sub = sub.rename(columns={"weight": "valor"})
-                        top = _top_n(sub, "valor", 3)
-                        for _, r in top.iterrows():
-                            rows.append({
-                                "Categoría": nombre,
-                                "Valor": (f"{float(r['valor']):.1f} kg" if pd.notna(r.get('valor')) else ""),
-                                "Fecha": r.get("date", ""),
-                                "Detalle": r.get("exercise", "")
-                            })
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        if len(seasons) == 0:
+            st.info("No hay datos registrados.")
         else:
-            st.info("No hay datos suficientes para mostrar un Top 3 detallado.")
+            selected_season = st.selectbox("Temporada", seasons, key="season_launch_evt")
 
-        st.divider()
-        st.markdown("### Resumen histórico (por temporada)")
-        resumen_data = []
-        for temporada in seasons:
-            fila = {"Temporada": temporada}
-            if len(df_throws) > 0 and "season" in df_throws.columns and "distance" in df_throws.columns:
-                temp_j = df_throws[df_throws["season"] == temporada]
-                fila["Jabalina (m)"] = float(temp_j["distance"].max()) if len(temp_j) and not temp_j["distance"].dropna().empty else None
-            if len(df_gym) > 0 and "season" in df_gym.columns and "exercise" in df_gym.columns and "weight" in df_gym.columns:
-                temp_g = df_gym[df_gym["season"] == temporada]
-                def _best_kw2(df, pattern):
-                    sub = df[df["exercise"].str.contains(pattern, case=False, na=False)]
-                    return float(sub["weight"].max()) if len(sub) and not sub["weight"].dropna().empty else None
-                fila["Balón medicinal (kg)"] = _best_kw2(temp_g, "balon medicinal")
-                fila["Sentadilla (kg)"] = _best_kw2(temp_g, "sentadilla")
-                fila["Pectoral (kg)"] = _best_kw2(temp_g, "pectoral|press banca|bench")
-                fila["Pull Over (kg)"] = _best_kw2(temp_g, "pull over")
-            resumen_data.append(fila)
-        st.dataframe(pd.DataFrame(resumen_data), use_container_width=True)
+            # Filtramos la temporada seleccionada
+            if "season" in df_throws_evt.columns:
+                jdf = df_throws_evt[df_throws_evt["season"] == selected_season].copy()
+            else:
+                jdf = df_throws_evt.copy()
+
+            if len(jdf) == 0 or "distance" not in jdf.columns:
+                st.info(f"Sin datos de {('jabalina' if is_javelin else 'peso')} para esa temporada.")
+            else:
+                # Ordenar por distancia descendente (ranking)
+                jdf = jdf.dropna(subset=["distance"]).sort_values("distance", ascending=False)
+
+                # Construir tabla a mostrar
+                base_cols = ["date", "distance", "notes"]
+                # El lugar/sesión SOLO es relevante para jabalina (requisito del usuario)
+                if is_javelin and "session" in jdf.columns:
+                    show_cols = ["date", "session", "distance", "notes"]
+                else:
+                    show_cols = [c for c in base_cols if c in jdf.columns]
+
+                jdf_rank = jdf[show_cols].reset_index(drop=True)
+                st.dataframe(jdf_rank, use_container_width=True)
+
+                # Métrica de temporada
+                if not jdf["distance"].dropna().empty:
+                    best = jdf["distance"].max()
+                    fecha_best = jdf.loc[jdf["distance"].idxmax(), "date"]
+                    metric_card(
+                        f"Mejor {('jabalina' if is_javelin else 'peso')}",
+                        f"{best:.2f} m",
+                        f"Fecha: {fecha_best}"
+                    )
+
+    # ---------------- Saltos (CRUD sobre best_marks) ---------------- #
+    with tabs[1]:
+        st.markdown("### Ranking de saltos")
+        SALTOS = [
+            ("salto profundidad", "cm"),
+            ("triple", "m"),
+            ("pentasalto", "m"),
+        ]
+        csel1, csel2 = st.columns(2)
+        disciplina_salto = csel1.selectbox("Disciplina", [d for d, _ in SALTOS])
+        unidad_salto = dict(SALTOS)[disciplina_salto]
+        temporada_salto = csel2.number_input("Temporada (año)", min_value=2000, max_value=2100, value=dt.date.today().year)
+
+        # Form para añadir/editar
+        with st.form("form_saltos"):
+            c1, c2, c3 = st.columns(3)
+            date = c1.date_input("Fecha", value=dt.date.today(), key="saltos_date")
+            value = c2.number_input(f"Marca ({unidad_salto})", min_value=0.0, step=0.01, key="saltos_val")
+            notes = c3.text_input("Notas", key="saltos_notes")
+            add = st.form_submit_button("Añadir marca")
+        if add:
+            insert_row("best_marks", {
+                "date": str(date),
+                "season": int(temporada_salto),
+                "grp": "saltos",
+                "discipline": disciplina_salto,
+                "value": float(value),
+                "unit": unidad_salto,
+                "notes": notes,
+                "athlete": atleta,  # ← no mezclar atletas
+            })
+            st.success("Marca añadida ✅")
+            st.cache_data.clear()
+
+        # Tabla + edición/eliminación
+        saltos_df = df_best[
+            (df_best["grp"]=="saltos") &
+            (df_best["discipline"]==disciplina_salto) &
+            (df_best["season"]==int(temporada_salto))
+        ].copy()
+        saltos_df = saltos_df.sort_values("value", ascending=False)
+        st.dataframe(saltos_df, use_container_width=True)
+
+        if len(saltos_df) > 0:
+            st.markdown("#### Editar / borrar")
+            rid = st.selectbox("ID a editar/borrar", saltos_df["id"].tolist(), key="saltos_edit_id")
+            row = saltos_df[saltos_df["id"]==rid].iloc[0]
+            with st.form("edit_saltos"):
+                c1, c2, c3 = st.columns(3)
+                e_date = c1.date_input("Fecha", value=pd.to_datetime(row["date"]).date(), key="saltos_e_date")
+                e_value = c2.number_input(f"Marca ({row['unit']})", value=float(row["value"]), min_value=0.0, step=0.01, key="saltos_e_val")
+                e_notes = c3.text_input("Notas", value=row.get("notes",""), key="saltos_e_notes")
+                cc1, cc2 = st.columns(2)
+                ok_update = cc1.form_submit_button("Guardar cambios")
+                ok_del = cc2.form_submit_button("Eliminar", type="secondary")
+            if ok_update:
+                update_row("best_marks", int(rid), {
+                    "date": str(e_date),
+                    "value": float(e_value),
+                    "notes": e_notes,
+                })
+                st.success("Marca actualizada ✅")
+                st.cache_data.clear()
+            if ok_del:
+                delete_row("best_marks", int(rid))
+                st.success("Marca eliminada ✅")
+                st.cache_data.clear()
+
+    # ---------------- Pesas (CRUD) ---------------- #
+    with tabs[2]:
+        st.markdown("### Ranking de pesas")
+        PESAS = [
+            ("sentadilla", "kg"),
+            ("arrancada", "kg"),
+            ("cargada", "kg"),
+            ("pull over", "kg"),
+            ("pectoral", "kg"),
+            ("hip thrust", "kg"),
+        ]
+        csel1, csel2 = st.columns(2)
+        disciplina_pesa = csel1.selectbox("Ejercicio", [d for d, _ in PESAS])
+        unidad_pesa = dict(PESAS)[disciplina_pesa]
+        temporada_pesa = csel2.number_input("Temporada (año)", min_value=2000, max_value=2100, value=dt.date.today().year, key="pesa_temp")
+
+        with st.form("form_pesas"):
+            c1, c2, c3 = st.columns(3)
+            date = c1.date_input("Fecha", value=dt.date.today(), key="pesas_date")
+            value = c2.number_input(f"Marca ({unidad_pesa})", min_value=0.0, step=0.5, key="pesas_val")
+            notes = c3.text_input("Notas", key="pesas_notes")
+            add = st.form_submit_button("Añadir marca")
+        if add:
+            insert_row("best_marks", {
+                "date": str(date),
+                "season": int(temporada_pesa),
+                "grp": "pesas",
+                "discipline": disciplina_pesa,
+                "value": float(value),
+                "unit": unidad_pesa,
+                "notes": notes,
+                "athlete": atleta,  # ← no mezclar atletas
+            })
+            st.success("Marca añadida ✅")
+            st.cache_data.clear()
+
+        pesas_df = df_best[
+            (df_best["grp"]=="pesas") &
+            (df_best["discipline"]==disciplina_pesa) &
+            (df_best["season"]==int(temporada_pesa))
+        ].copy()
+        pesas_df = pesas_df.sort_values("value", ascending=False)
+        st.dataframe(pesas_df, use_container_width=True)
+
+        if len(pesas_df) > 0:
+            st.markdown("#### Editar / borrar")
+            rid = st.selectbox("ID a editar/borrar", pesas_df["id"].tolist(), key="pesas_edit_id")
+            row = pesas_df[pesas_df["id"]==rid].iloc[0]
+            with st.form("edit_pesas"):
+                c1, c2, c3 = st.columns(3)
+                e_date = c1.date_input("Fecha", value=pd.to_datetime(row["date"]).date(), key="pesas_e_date")
+                e_value = c2.number_input(f"Marca ({row['unit']})", value=float(row["value"]), min_value=0.0, step=0.5, key="pesas_e_val")
+                e_notes = c3.text_input("Notas", value=row.get("notes",""), key="pesas_e_notes")
+                cc1, cc2 = st.columns(2)
+                ok_update = cc1.form_submit_button("Guardar cambios")
+                ok_del = cc2.form_submit_button("Eliminar", type="secondary")
+            if ok_update:
+                update_row("best_marks", int(rid), {
+                    "date": str(e_date),
+                    "value": float(e_value),
+                    "notes": e_notes,
+                })
+                st.success("Marca actualizada ✅")
+                st.cache_data.clear()
+            if ok_del:
+                delete_row("best_marks", int(rid))
+                st.success("Marca eliminada ✅")
+                st.cache_data.clear()
+
+    # ---------------- Velocidad (CRUD) ---------------- #
+    with tabs[3]:
+        st.markdown("### Ranking de velocidad")
+        VELOCIDADES = [
+            ("30 m", "s"),
+            ("60 m", "s"),
+            ("100 m", "s"),
+            ("150 m", "s"),
+            ("200 m", "s"),
+        ]
+        csel1, csel2 = st.columns(2)
+        disciplina_vel = csel1.selectbox("Prueba", [d for d, _ in VELOCIDADES])
+        unidad_vel = dict(VELOCIDADES)[disciplina_vel]
+        temporada_vel = csel2.number_input("Temporada (año)", min_value=2000, max_value=2100, value=dt.date.today().year, key="vel_temp")
+
+        with st.form("form_vel"):
+            c1, c2, c3 = st.columns(3)
+            date = c1.date_input("Fecha", value=dt.date.today(), key="vel_date")
+            value = c2.number_input(f"Marca ({unidad_vel})", min_value=0.0, step=0.01, key="vel_val")
+            notes = c3.text_input("Notas", key="vel_notes")
+            add = st.form_submit_button("Añadir marca")
+        if add:
+            insert_row("best_marks", {
+                "date": str(date),
+                "season": int(temporada_vel),
+                "grp": "velocidad",
+                "discipline": disciplina_vel,
+                "value": float(value),
+                "unit": unidad_vel,
+                "notes": notes,
+                "athlete": atleta,  # ← no mezclar atletas
+            })
+            st.success("Marca añadida ✅")
+            st.cache_data.clear()
+
+        # En velocidad, menor tiempo es mejor → ordenar ascendente
+        vel_df = df_best[
+            (df_best["grp"]=="velocidad") &
+            (df_best["discipline"]==disciplina_vel) &
+            (df_best["season"]==int(temporada_vel))
+        ].copy()
+        vel_df = vel_df.sort_values("value", ascending=True)
+        st.dataframe(vel_df, use_container_width=True)
+
+        if len(vel_df) > 0:
+            st.markdown("#### Editar / borrar")
+            rid = st.selectbox("ID a editar/borrar", vel_df["id"].tolist(), key="vel_edit_id")
+            row = vel_df[vel_df["id"]==rid].iloc[0]
+            with st.form("edit_vel"):
+                c1, c2, c3 = st.columns(3)
+                e_date = c1.date_input("Fecha", value=pd.to_datetime(row["date"]).date(), key="vel_e_date")
+                e_value = c2.number_input(f"Marca ({row['unit']})", value=float(row["value"]), min_value=0.0, step=0.01, key="vel_e_val")
+                e_notes = c3.text_input("Notas", value=row.get("notes",""), key="vel_e_notes")
+                cc1, cc2 = st.columns(2)
+                ok_update = cc1.form_submit_button("Guardar cambios")
+                ok_del = cc2.form_submit_button("Eliminar", type="secondary")
+            if ok_update:
+                update_row("best_marks", int(rid), {
+                    "date": str(e_date),
+                    "value": float(e_value),
+                    "notes": e_notes,
+                })
+                st.success("Marca actualizada ✅")
+                st.cache_data.clear()
+            if ok_del:
+                delete_row("best_marks", int(rid))
+                st.success("Marca eliminada ✅")
+                st.cache_data.clear()
+
+
+# ---------------------------- Entrenamientos ---------------------------- #
+elif section_key == "Entrenamientos":
+    st.markdown("## 📝 Entrenamientos")
+
+    # Garantiza que exista la tabla 'trainings' (por si es la 1ª vez)
+    with get_conn() as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trainings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
+                block TEXT,
+                exercise TEXT,
+                sets TEXT,
+                reps TEXT,
+                load TEXT,
+                rest TEXT,
+                notes TEXT
+            )
+            """
+        )
+        con.commit()
+
+    st.markdown(
+        "Sube un archivo de **Excel/CSV** para importarlo a la base de datos o un **PDF** para archivarlo."
+    )
+
+    up = st.file_uploader(
+        "Selecciona un archivo (.xlsx, .xls, .csv o .pdf)",
+        type=["xlsx", "xls", "csv", "pdf"],
+        key="tr_upload_min",
+    )
+
+    if up is not None:
+        filename = up.name.lower()
+
+        # PDF → solo guardar en disco (no se importa a BD)
+        if filename.endswith(".pdf"):
+            saved_path = save_upload(up, "trainings")
+            st.success(f"PDF guardado en: {saved_path}")
+            st.info("El PDF queda almacenado en 'uploads/trainings'. No se importan filas a la base de datos.")
+
+        # Excel/CSV → importar filas a la tabla 'trainings'
+        else:
+            try:
+                if filename.endswith(".csv"):
+                    df_new = pd.read_csv(up)
+                else:
+                    df_new = pd.read_excel(up)
+            except Exception as e:
+                st.error(f"No se pudo leer el archivo: {e}")
+                df_new = None
+
+            if df_new is not None and not df_new.empty:
+                # Normaliza nombres de columnas (si están en español)
+                colmap = {
+                    "fecha": "date",
+                    "bloque": "block",
+                    "ejercicio": "exercise",
+                    "series": "sets",
+                    "reps": "reps",
+                    "carga": "load",
+                    "descanso": "rest",
+                    "notas": "notes",
+                }
+                df_norm = df_new.rename(
+                    columns={k: v for k, v in colmap.items() if k in df_new.columns}
+                )
+
+                # Asegura columnas requeridas
+                required = ["date", "block", "exercise", "sets", "reps", "load", "rest", "notes"]
+                for col in required:
+                    if col not in df_norm.columns:
+                        df_norm[col] = None
+
+                # Inserta fila a fila
+                insertados = 0
+                for _, r in df_norm.iterrows():
+                    insert_row(
+                        "trainings",
+                        {
+                            "date": str(r["date"]) if pd.notna(r["date"]) else None,
+                            "block": str(r["block"]) if pd.notna(r["block"]) else None,
+                            "exercise": str(r["exercise"]) if pd.notna(r["exercise"]) else None,
+                            "sets": str(r["sets"]) if pd.notna(r["sets"]) else None,
+                            "reps": str(r["reps"]) if pd.notna(r["reps"]) else None,
+                            "load": str(r["load"]) if pd.notna(r["load"]) else None,
+                            "rest": str(r["rest"]) if pd.notna(r["rest"]) else None,
+                            "notes": str(r["notes"]) if pd.notna(r["notes"]) else None,
+                        },
+                    )
+                    insertados += 1
+
+                st.success(f"Se importaron {insertados} filas a 'trainings' ✅")
+                st.cache_data.clear()
+
+    st.divider()
+    # Vista rápida de lo que hay en la BD (opcional, sin edición)
+    try:
+        df_tr = load_table("trainings")
+        if len(df_tr) > 0:
+            st.markdown("#### Entrenamientos en BD")
+            st.dataframe(df_tr, use_container_width=True)
+        else:
+            st.info("Aún no hay entrenamientos importados.")
+    except Exception as e:
+        st.warning(f"No se pudo cargar 'trainings': {e}")
+
 
 # ---------------------------- Rendimiento ---------------------------- #
 
 elif section_key == "Rendimiento":
     st.markdown("## 📈 Rendimiento y carga")
 
+    # Cargar y filtrar SIEMPRE por atleta (y por evento en throws)
+    df_t = load_table("throws")
+    if len(df_t) > 0:
+        if "athlete" in df_t.columns:
+            df_t = df_t[df_t["athlete"] == atleta]
+        if "event" in df_t.columns:
+            df_t = df_t[df_t["event"] == athlete_event]
+
+    df_f = load_table("fatigue")
+    if len(df_f) > 0 and "athlete" in df_f.columns:
+        df_f = df_f[df_f["athlete"] == atleta]
+
+    df_g = load_table("gym_logs")
+    if len(df_g) > 0 and "athlete" in df_g.columns:
+        df_g = df_g[df_g["athlete"] == atleta]
+
     # Encabezado de KPIs
     colK1, colK2, colK3 = st.columns(3)
-    df_t = load_table("throws")
-    df_f = load_table("fatigue")
     best = float(df_t["distance"].max()) if len(df_t) and not df_t["distance"].dropna().empty else None
     avg_rpe = float(df_f["rpe"].mean()) if len(df_f) and not df_f["rpe"].dropna().empty else None
     with colK1:
-        metric_card("Mejor jabalina histórico", f"{best:.2f} m" if best else "—")
+        metric_card(
+            "Mejor lanzamiento histórico",
+            f"{best:.2f} m" if best else "—",
+            f"Atleta: {atleta} • Evento: {athlete_event.capitalize()}"
+        )
     with colK2:
         metric_card("RPE medio", f"{avg_rpe:.1f}" if avg_rpe else "—")
     with colK3:
@@ -576,6 +1093,7 @@ elif section_key == "Rendimiento":
             "sleep_hours": float(sleep_hours),
             "soreness": int(soreness),
             "notes": notes,
+            "athlete": atleta,  # ← guardar el atleta
         })
         st.success("Fatiga registrada ✅")
         st.cache_data.clear()
@@ -586,27 +1104,29 @@ elif section_key == "Rendimiento":
         if len(df_t) > 0:
             plot_df = df_t.dropna(subset=["distance"]).copy()
             if len(plot_df) > 0:
-                plot_df["date"] = pd.to_datetime(plot_df["date"]).sort_values()
+                plot_df["date"] = pd.to_datetime(plot_df["date"], errors="coerce")
+                plot_df = plot_df.sort_values("date")
                 fig, ax = plt.subplots()
                 ax.plot(plot_df["date"], plot_df["distance"], marker="o")
                 ax.set_xlabel("Fecha")
                 ax.set_ylabel("Distancia (m)")
-                ax.set_title("Distancia por sesión")
+                ax.set_title(f"Distancia por sesión — {atleta}")
                 st.pyplot(fig)
             else:
                 st.info("Añade distancias para ver la gráfica.")
         else:
-            st.info("Sin datos de lanzamientos.")
+            st.info("Sin datos de lanzamientos para este atleta.")
     with cB:
         st.markdown("#### Carga percibida (RPE)")
         if len(df_f) > 0:
             plot_df = df_f.copy()
-            plot_df["date"] = pd.to_datetime(plot_df["date"]).sort_values()
+            plot_df["date"] = pd.to_datetime(plot_df["date"], errors="coerce")
+            plot_df = plot_df.sort_values("date")
             fig, ax = plt.subplots()
             ax.plot(plot_df["date"], plot_df["rpe"], marker="o")
             ax.set_xlabel("Fecha")
             ax.set_ylabel("RPE (1-10)")
-            ax.set_title("Percepción de esfuerzo")
+            ax.set_title(f"Percepción de esfuerzo — {atleta}")
             st.pyplot(fig)
         else:
             st.info("Registra RPE para ver tendencias.")
@@ -630,11 +1150,16 @@ elif section_key == "Rendimiento":
             "reps": int(reps),
             "velocity": float(velocity) if velocity else None,
             "notes": notes,
+            "athlete": atleta,  # ← guardar el atleta
         })
         st.success("Sesión de fuerza guardada ✅")
         st.cache_data.clear()
 
-    st.dataframe(load_table("gym_logs"), use_container_width=True)
+    # Mostrar solo los logs del atleta
+    df_g_show = load_table("gym_logs")
+    if len(df_g_show) > 0 and "athlete" in df_g_show.columns:
+        df_g_show = df_g_show[df_g_show["athlete"] == atleta]
+    st.dataframe(df_g_show, use_container_width=True)
 
 # ---------------------------- Planificación ---------------------------- #
 
@@ -774,9 +1299,9 @@ elif section_key == "Ajustes":
     st.markdown("## ⚙️ Ajustes y utilidades")
 
     with st.expander("Exportar datos (.csv)", expanded=True):
-        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-        tables = ["throws", "fatigue", "gym_logs", "injuries", "plans", "goals", "chat"]
-        buttons = [c1, c2, c3, c4, c5, c6, c7]
+        c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+        tables = ["throws", "fatigue", "gym_logs", "injuries", "plans", "goals", "chat", "best_marks"]
+        buttons = [c1, c2, c3, c4, c5, c6, c7, c8]
         for t, col in zip(tables, buttons):
             with col:
                 df = load_table(t)
@@ -790,18 +1315,13 @@ elif section_key == "Ajustes":
                 )
 
     with st.expander("Borrar registros (usar con cuidado)"):
-        target_table = st.selectbox("Tabla", ["throws", "fatigue", "gym_logs", "injuries", "plans", "goals", "chat"])
+        target_table = st.selectbox("Tabla", ["throws", "fatigue", "gym_logs", "injuries", "plans", "goals", "chat", "best_marks"])
         df = load_table(target_table)
         if len(df) > 0:
             rid = st.number_input("ID a borrar", min_value=int(df["id"].min()), max_value=int(df["id"].max()))
-            if st.button("Borrar por ID"):
+            if st.button("Borrar por ID", type="secondary"):
                 delete_row(target_table, int(rid))
                 st.success("Eliminado ✅")
                 st.cache_data.clear()
         else:
             st.info("No hay filas en esta tabla.")
-
-# ---------------------------- Footer ---------------------------- #
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Consejo: para extraer fotogramas instala OpenCV: `pip install opencv-python`.Para usarla como PWA en iPhone: Safari → Compartir → *Añadir a pantalla de inicio*.")
